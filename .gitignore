@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS / System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large Dataset Files
+*.tsv
+dataset/train/
+dataset/test/
+dataset/benchmark/
+dataset/candidate_pairs.tsv
+candidate_pairs.tsv
+
+# Large Archives & Models
+*.zip
+*.tar.gz
+*.pkl
+*.pt
+*.bin
+*.onnx
+
+# Scratch logs & outputs
+*.log
