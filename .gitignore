@@ -15,12 +15,10 @@ desktop.ini
 *.swo
 
 # Large Dataset Files
-*.tsv
+*
 dataset/train/
 dataset/test/
 dataset/benchmark/
-dataset/candidate_pairs.tsv
-candidate_pairs.tsv
 
 # Large Archives & Models
 *.zip
