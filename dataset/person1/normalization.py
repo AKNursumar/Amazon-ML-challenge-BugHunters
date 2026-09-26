@@ -62,19 +62,24 @@ LEGAL_ENTITY_PATTERNS = [
     (r"\bcompany\b", "co"),
     (r"\bco\.?\b", "co"),
     (r"\bs\.a\.r\.l\.?\b", "sarl"),
+    (r"\bs\.a\.s\.u\.?\b", "sasu"),
     (r"\bs\.a\.s\.?\b", "sas"),
     (r"\bs\.a\.?\b", "sa"),
+    (r"\be\.u\.r\.l\.?\b", "eurl"),
+    (r"\bs\.c\.i\.?\b", "sci"),
+    (r"\bs\.n\.c\.?\b", "snc"),
+    (r"\bs\.c\.a\.?\b", "sca"),
     (r"\bg\.m\.b\.h\.?\b", "gmbh"),
     (r"\bl\.l\.p\.?\b", "llp"),
 ]
 
 LEGAL_SUFFIXES_SET: Set[str] = {
-    "pvt ltd", "ltd", "inc", "llc", "corp", "co", "plc", "llp", "sarl", "sas", "sa", "gmbh", "lp", "pvt", "private"
+    "pvt ltd", "ltd", "inc", "llc", "corp", "co", "plc", "llp", "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "sca", "gmbh", "lp", "pvt", "private"
 }
 
 # Generic business stopwords that carry low discrimination power
 GENERIC_BUSINESS_TERMS: Set[str] = {
-    "pvt", "ltd", "inc", "llc", "corp", "co", "plc", "llp", "sarl", "sas", "sa", "gmbh", "lp",
+    "pvt", "ltd", "inc", "llc", "corp", "co", "plc", "llp", "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "sca", "gmbh", "lp",
     "limited", "private", "corporation", "company", "incorporated",
     "enterprises", "services", "solutions", "technologies", "international", "group", "holdings",
     "consulting", "management", "industries", "associates", "ventures", "systems", "trading",
@@ -87,6 +92,33 @@ DOMAIN_SUFFIX_PATTERN = re.compile(r"\.(?:com|org|net|in|co\.in|co|io|biz|info)$
 
 # Leading noise patterns like >>, --, <<, ##, //
 LEADING_NOISE_PATTERN = re.compile(r"^[\s\-><#\*\/\+]+")
+
+
+def _extract_root_keyword(pattern_str: str) -> str:
+    s = pattern_str.replace(r"\b", "").replace(r"\\b", "").replace(r"\.?", "").replace(r"\.", "").replace(r"\s+", " ").replace(r"\s*", " ")
+    s = re.sub(r"[\(\)\?\:\-\#]", "", s).strip()
+    return s.split()[0].lower() if s else ""
+
+
+COMPILED_LEGAL_ENTITY_PATTERNS = [
+    (_extract_root_keyword(pat), re.compile(pat, re.IGNORECASE), f" {rep} ") for pat, rep in LEGAL_ENTITY_PATTERNS
+]
+
+RE_THE = re.compile(r"^the\s+", re.IGNORECASE)
+RE_OCR_0 = re.compile(r"(?<=[a-z])0(?=[a-z])", re.IGNORECASE)
+RE_OCR_1 = re.compile(r"(?<=[a-z])1(?=[a-z])", re.IGNORECASE)
+RE_MS1 = re.compile(r"^\s*m\s*\/\s*s\s+", re.IGNORECASE)
+RE_MS2 = re.compile(r"^\s*m\s*\.\s*s\s*\.?\s+", re.IGNORECASE)
+RE_WWW = re.compile(r"^www\.", re.IGNORECASE)
+RE_AMP = re.compile(r"\s*&\s*")
+RE_PUNCT_NAME = re.compile(r"[^\w\s]")
+RE_SPACE = re.compile(r"\s+")
+
+RE_ADDR_HASH = re.compile(r"#\s*")
+RE_ADDR_NO_DIGIT = re.compile(r"\bno\.?\s*(?=\d)", re.IGNORECASE)
+RE_ADDR_FRAC = re.compile(r"\b1\/2\b")
+RE_ADDR_LEAD_ZERO = re.compile(r"\b0+(\d+)\b")
+RE_ADDR_PUNCT = re.compile(r"[^\w\s\-\/]")
 
 
 def normalize_name(name: Optional[str]) -> str:
@@ -107,35 +139,35 @@ def normalize_name(name: Optional[str]) -> str:
 
     text = str(name).strip()
     text = strip_accents(text)
-    text = LEADING_NOISE_PATTERN.sub("", text).strip()
-    text = text.lower()
+    text = LEADING_NOISE_PATTERN.sub("", text).strip().lower()
 
     # Remove leading 'the '
-    text = re.sub(r"^the\s+", "", text)
+    text = RE_THE.sub("", text)
 
     # Normalize OCR/digit substitutions inside words (e.g. k0ch -> koch, neighb0rhood -> neighborhood)
-    text = re.sub(r"(?<=[a-z])0(?=[a-z])", "o", text)
-    text = re.sub(r"(?<=[a-z])1(?=[a-z])", "l", text)
+    text = RE_OCR_0.sub("o", text)
+    text = RE_OCR_1.sub("l", text)
 
     # Remove leading 'm/s' or 'm / s'
-    text = re.sub(r"^\s*m\s*\/\s*s\s+", "", text)
-    text = re.sub(r"^\s*m\s*\.\s*s\s*\.?\s+", "", text)
+    text = RE_MS1.sub("", text)
+    text = RE_MS2.sub("", text)
 
     # Normalize domain names (e.g., 'maurewilliamscolombier.com' -> 'maurewilliamscolombier')
     text = DOMAIN_SUFFIX_PATTERN.sub("", text)
-    text = re.sub(r"^www\.", "", text)
+    text = RE_WWW.sub("", text)
 
     # Normalize ampersand
-    text = re.sub(r"\s*&\s*", " and ", text)
+    text = RE_AMP.sub(" and ", text)
 
-    # Normalize legal forms
-    for pat, rep in LEGAL_ENTITY_PATTERNS:
-        text = re.sub(pat, f" {rep} ", text)
+    # Normalize legal forms using keyword-guarded precompiled regexes
+    for kw, pat, rep in COMPILED_LEGAL_ENTITY_PATTERNS:
+        if not kw or kw in text:
+            text = pat.sub(rep, text)
 
     # Remove punctuation, keep letters, digits, and unicode words
-    text = re.sub(r"[^\w\s]", " ", text)
+    text = RE_PUNCT_NAME.sub(" ", text)
     # Collapse multiple whitespaces
-    text = re.sub(r"\s+", " ", text).strip()
+    text = RE_SPACE.sub(" ", text).strip()
 
     return text
 
@@ -203,6 +235,16 @@ STREET_MAPPINGS = [
     (r"\btrail\b", "trl"),
     (r"\bplace\b", "pl"),
     (r"\bsquare\b", "sq"),
+    # French street types
+    (r"\brue\b", "st"),
+    (r"\bchemin\b", "ch"),
+    (r"\bimpasse\b", "imp"),
+    (r"\ball[eé]e\b", "all"),
+    (r"\broute\b", "rte"),
+    (r"\bquai\b", "quai"),
+    (r"\bcours\b", "crs"),
+    (r"\bpassage\b", "pass"),
+    (r"\bfaubourg\b", "fbg"),
 ]
 
 # Unit and building indicator mappings
@@ -223,6 +265,17 @@ UNIT_MAPPINGS = [
     (r"\bkh\s*(?:no\.?|-)\s*", "kh "),
     (r"\bp\.?\s*o\.?\s*box\b", "pobox"),
     (r"\bpo\s+box\b", "pobox"),
+    # French unit and building types
+    (r"\bb[aâ]timent\b", "bldg"),
+    (r"\bb[aâ]t\.?\b", "bldg"),
+    (r"\b[eé]tage\b", "fl"),
+    (r"\br[eé]sidence\b", "res"),
+    (r"\bporte\b", "door"),
+    (r"\bb\.?\s*p\.?\b", "pobox"),
+    (r"\bcedex\b", "cedex"),
+    (r"\bz\.?\s*i\.?\b", "zi"),
+    (r"\bz\.?\s*a\.?\b", "za"),
+    (r"\bz\.?\s*a\.?\s*c\.?\b", "zac"),
     (r"\bnull\b", " "),
 ]
 
@@ -268,6 +321,12 @@ STATE_MAPPINGS = [
 ]
 
 
+COMPILED_ADDR_PATTERNS = [
+    (_extract_root_keyword(pat), re.compile(pat, re.IGNORECASE), f" {rep} ")
+    for pat, rep in STREET_MAPPINGS + UNIT_MAPPINGS + STATE_MAPPINGS
+]
+
+
 def normalize_address(address: Optional[str]) -> str:
     """
     Robust address normalization:
@@ -283,35 +342,27 @@ def normalize_address(address: Optional[str]) -> str:
         return ""
 
     text = str(address).strip()
-    text = strip_accents(text)
-    text = text.lower()
+    text = strip_accents(text).lower()
 
     # Remove noise like '#' or 'no.' before digits
-    text = re.sub(r"#\s*", "", text)
-    text = re.sub(r"\bno\.?\s*(?=\d)", "", text)
+    text = RE_ADDR_HASH.sub("", text)
+    text = RE_ADDR_NO_DIGIT.sub("", text)
 
-    # Street types
-    for pat, rep in STREET_MAPPINGS:
-        text = re.sub(pat, f" {rep} ", text)
-
-    # Units
-    for pat, rep in UNIT_MAPPINGS:
-        text = re.sub(pat, f" {rep} ", text)
-
-    # States
-    for pat, rep in STATE_MAPPINGS:
-        text = re.sub(pat, f" {rep} ", text)
+    # Street types, Units, and States using keyword-guarded precompiled regexes
+    for kw, pat, rep in COMPILED_ADDR_PATTERNS:
+        if not kw or kw in text:
+            text = pat.sub(rep, text)
 
     # Normalize isolated fractions like 1/2
-    text = re.sub(r"\b1\/2\b", "", text)
+    text = RE_ADDR_FRAC.sub("", text)
 
     # Normalize leading zeros in isolated numbers (e.g. 0189 -> 189)
-    text = re.sub(r"\b0+(\d+)\b", r"\1", text)
+    text = RE_ADDR_LEAD_ZERO.sub(r"\1", text)
 
     # Punctuation to space, except keeping alphanumeric and hyphens/slashes in building numbers like AF-684 or 59/101
-    text = re.sub(r"[^\w\s\-\/]", " ", text)
+    text = RE_ADDR_PUNCT.sub(" ", text)
     # Collapse multiple whitespaces
-    text = re.sub(r"\s+", " ", text).strip()
+    text = RE_SPACE.sub(" ", text).strip()
 
     return text
 
@@ -333,7 +384,11 @@ def extract_address_key(normalized_addr: str) -> str:
         "apt", "ste", "unit", "shop", "door", "hno", "block", "floor", "fl", "ground",
         "near", "opp", "opposite", "behind", "road", "rd", "street", "st", "lane", "ln",
         "avenue", "ave", "drive", "dr", "highway", "hwy", "court", "ct", "circle", "cir",
-        "terrace", "ter", "expressway", "expy", "parkway", "pkwy", "trail", "trl", "pl", "sq"
+        "terrace", "ter", "expressway", "expy", "parkway", "pkwy", "trail", "trl", "pl", "sq",
+        # French street and address stop words
+        "rue", "ch", "chemin", "impasse", "imp", "all", "allee", "route", "rte", "quai",
+        "cours", "crs", "pass", "passage", "fbg", "faubourg", "cedex", "res", "bldg",
+        "de", "la", "du", "des", "le", "les", "en", "sur"
     }
 
     tokens = [t for t in normalized_addr.split() if t not in ignored_tokens]

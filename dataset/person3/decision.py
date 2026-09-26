@@ -23,6 +23,45 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import pandas as pd
 
 
+BRANCH_DIRECTIONS = {
+    "north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest", "central",
+}
+BRANCH_DIVISIONS = {
+    "retail", "wholesale", "express", "logistics", "distribution", "services", "capital", "holdings",
+}
+
+
+def has_branch_conflict(name1: str, name2: str) -> bool:
+    """Return True if two business names have contradictory directional or division tags."""
+    if not name1 or not name2:
+        return False
+    toks1 = set(str(name1).lower().split())
+    toks2 = set(str(name2).lower().split())
+
+    dirs1 = toks1.intersection(BRANCH_DIRECTIONS)
+    dirs2 = toks2.intersection(BRANCH_DIRECTIONS)
+    if dirs1 and dirs2 and dirs1 != dirs2:
+        return True
+
+    divs1 = toks1.intersection(BRANCH_DIVISIONS)
+    divs2 = toks2.intersection(BRANCH_DIVISIONS)
+    if divs1 and divs2 and divs1 != divs2:
+        return True
+
+    return False
+
+
+def has_building_clash(bldg1: str, bldg2: str, core1: str, core2: str) -> bool:
+    """
+    Return True if both entities have extracted non-empty building/plot numbers
+    and they differ, unless core business names are identical.
+    """
+    if bldg1 and bldg2 and bldg1 != bldg2:
+        if core1 != core2:
+            return True
+    return False
+
+
 class DecisionEngine:
     """
     Final decision engine applying threshold filtering, singleton guarding,

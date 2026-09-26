@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--source3", type=str, default="benchmark/eval_source3.tsv", help="Path to Source 3 TSV")
     parser.add_argument("--output", type=str, default="candidate_pairs.tsv", help="Path to output TSV")
     parser.add_argument("--sample", type=int, default=None, help="Sample N rows from Source 1 for quick run")
-    parser.add_argument("--max_cands", type=int, default=300, help="Max candidates per query")
+    parser.add_argument("--max_cands", type=int, default=20, help="Max candidates per query (default: 20)")
     parser.add_argument("--max_block_size", type=int, default=1000, help="Max candidates per block before pruning")
 
     args = parser.parse_args()

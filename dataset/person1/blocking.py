@@ -116,13 +116,19 @@ def get_record_blocking_keys(
                 # Slash plot numbers like 126/4 or 59/101
                 elif "/" in tok and any(c.isdigit() for c in tok) and len(tok) <= 8:
                     keys.add(f"{country}|PLOT|{tok}")
+                # Postal code (5 digits for France/US, 6 digits for India) + core name prefix
+                elif tok.isdigit() and len(tok) in (5, 6) and len(compressed_core) >= 3:
+                    keys.add(f"{country}|POSTAL|{tok}_{compressed_core[:3]}")
 
         # 7. Non-numeric Locality Key (for commercial / highway addresses without house numbers)
         if "address_locality" in active:
             ignored_addr = {
                 "rd", "st", "ave", "dr", "ln", "hwy", "blvd", "ct", "cir", "fl", "apt", "ste",
                 "unit", "shop", "near", "opp", "opposite", "behind", "hotel", "road", "street",
-                "highway", "lane", "avenue", "drive", "floor", "ground", "block", "sector", "building"
+                "highway", "lane", "avenue", "drive", "floor", "ground", "block", "sector", "building",
+                # French street & address terms
+                "rue", "ch", "chemin", "impasse", "imp", "all", "allee", "route", "rte", "quai",
+                "cours", "crs", "pass", "passage", "fbg", "faubourg", "cedex", "res", "bldg"
             }
             sig_addr_words = [w for w in addr_tokens if len(w) >= 4 and w not in ignored_addr and w.isalpha()]
             if len(sig_addr_words) >= 2:

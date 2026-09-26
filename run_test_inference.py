@@ -2,19 +2,27 @@
 Full Test Set Inference Pipeline for Amazon ML Challenge 2026.
 Team: BugHunters
 
-Applies the exact Person 1 blocking, Person 2 feature pipeline, and trained LightGBM model (threshold=0.80)
-to generate the official test submission files:
+Applies:
+1. Scalable Country Partitioning (Zero cross-country leakage).
+2. Key-Weighted Inverted Index Blocking with Compact Candidate Generation (Top-20 cands/S1).
+3. 26-Feature Extraction (C++ RapidFuzz string metrics + structured indicators).
+4. Champion LightGBM Classifier (prob >= 0.75 calibrated for Macro F0.5).
+5. Deterministic Singleton Guard & Strict Candidate Subset Enforcement.
+6. Official validation via utils/validate_submission.py.
+
+Produces:
 - output/matching_results.tsv
 - output/candidate_pairs.tsv
 """
 
+import argparse
 import os
 import sys
 import gc
 import time
 import joblib
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
@@ -37,13 +45,62 @@ from dataset.person1.normalization import (
     normalize_country,
 )
 from dataset.person1.blocking import BlockingIndex, generate_blocking_keys
+from dataset.person1.candidate_generation import DEFAULT_KEY_WEIGHTS
 from dataset.person2.features import (
     ALL_FEATURES,
     load_entity_lookups,
     generate_feature_matrix,
+    extract_char_ngrams,
+    extract_building_no,
+    extract_locality_tokens,
 )
-from dataset.person3.decision import format_submission_files
+from dataset.person3.decision import (
+    format_submission_files,
+    has_branch_conflict,
+    has_building_clash,
+)
 from utils.validate_submission import validate
+
+
+def fast_preprocess_record(
+    raw_name: str,
+    raw_addr: str,
+    raw_country: str,
+    norm_n: str,
+    core_n: str,
+    norm_a: str,
+    norm_c: str,
+) -> Dict[str, object]:
+    """Preprocess entity record using pre-normalized strings without re-running regexes."""
+    raw_name = str(raw_name) if pd.notna(raw_name) else ""
+    raw_addr = str(raw_addr) if pd.notna(raw_addr) else ""
+    raw_country = str(raw_country) if pd.notna(raw_country) else ""
+    norm_n = str(norm_n) if pd.notna(norm_n) else ""
+    core_n = str(core_n) if pd.notna(core_n) else ""
+    norm_a = str(norm_a) if pd.notna(norm_a) else ""
+    norm_c = str(norm_c) if pd.notna(norm_c) else ""
+
+    name_tokens = norm_n.split()
+    addr_tokens = norm_a.split()
+
+    return {
+        "raw_name": raw_name,
+        "norm_name": norm_n,
+        "core_name": core_n,
+        "name_tokens": name_tokens,
+        "name_token_set": set(name_tokens),
+        "core_token_set": set(core_n.split()),
+        "name_char_3grams": extract_char_ngrams(norm_n, 3),
+        "raw_addr": raw_addr,
+        "norm_addr": norm_a,
+        "addr_tokens": addr_tokens,
+        "addr_token_set": set(addr_tokens),
+        "addr_char_3grams": extract_char_ngrams(norm_a, 3),
+        "bldg_no": extract_building_no(norm_a),
+        "locality_set": extract_locality_tokens(norm_a),
+        "country": norm_c,
+    }
+
 
 
 def run_full_test_inference(
@@ -51,29 +108,34 @@ def run_full_test_inference(
     model_path: str = "dataset/person2/models/best_model.pkl",
     output_matching_path: str = "output/matching_results.tsv",
     output_candidate_path: str = "output/candidate_pairs.tsv",
-    threshold: float = 0.80,
+    threshold: float = 0.75,
     max_block_size: int = 1000,
-    max_candidates_per_query: int = 300,
-    s1_batch_size: int = 50_000,
-):
+    max_candidates_per_query: int = 20,
+    s1_batch_size: int = 25_000,
+    country_filter: Optional[str] = None,
+) -> Dict:
     start_time = time.time()
     print("=" * 85, flush=True)
     print("RUNNING OFFICIAL TEST SET INFERENCE PIPELINE", flush=True)
-    print(f"Test Directory: {test_dir}", flush=True)
-    print(f"Model Path:     {model_path}", flush=True)
-    print(f"Threshold:      {threshold:.2f}", flush=True)
-    print(f"Matching Out:   {output_matching_path}", flush=True)
-    print(f"Candidate Out:  {output_candidate_path}", flush=True)
+    print(f"Test Directory:  {test_dir}", flush=True)
+    print(f"Model Path:      {model_path}", flush=True)
+    print(f"Threshold (T):   {threshold:.2f}", flush=True)
+    print(f"Max Cands / S1:  {max_candidates_per_query}", flush=True)
+    print(f"S1 Batch Size:   {s1_batch_size:,}", flush=True)
+    if country_filter:
+        print(f"Country Filter:  {country_filter}", flush=True)
+    print(f"Matching Out:    {output_matching_path}", flush=True)
+    print(f"Candidate Out:   {output_candidate_path}", flush=True)
     print("=" * 85, flush=True)
 
-    # 1. Load trained LightGBM model
+    # 1. Load trained LightGBM champion model
     print("\n[Step 1/6] Loading LightGBM champion model...", flush=True)
     payload = joblib.load(model_path)
     model = payload["model"]
     feature_names = payload.get("feature_names", ALL_FEATURES)
     assert feature_names == ALL_FEATURES, "Feature names mismatch!"
     print(f"  Model successfully loaded: {payload.get('model_name', type(model).__name__)}", flush=True)
-    print(f"  Using threshold: {threshold:.2f}", flush=True)
+    print(f"  Calibrated decision threshold: {threshold:.2f}", flush=True)
 
     # 2. Read full list of required Source 1 IDs in exact order
     test_s1_path = os.path.join(test_dir, "test_source1.tsv")
@@ -86,9 +148,13 @@ def run_full_test_inference(
     print(f"  Total Test Source 1 entities: {len(all_required_s1_ids):,}", flush=True)
 
     countries = s1_full_df["country"].unique().tolist()
-    print(f"  Test countries: {countries}", flush=True)
+    if country_filter:
+        countries = [c for c in countries if c.lower() == country_filter.lower()]
+        print(f"  Filtered test countries: {countries}", flush=True)
+    else:
+        print(f"  All test countries: {countries}", flush=True)
 
-    # Dictionaries to store final outputs
+    # Dictionaries to store final outputs (maps entity_id -> List[str])
     matching_map: Dict[str, List[str]] = {}
     candidates_map: Dict[str, List[str]] = {}
 
@@ -145,7 +211,7 @@ def run_full_test_inference(
         s3_c["norm_addr"] = s3_c["business_address"].apply(normalize_address)
         s3_c["norm_country"] = s3_c["country"].apply(normalize_country)
 
-        # Build Blocking Inverted Index
+        # Build Inverted Blocking Index
         print("  Building inverted blocking index...", flush=True)
         t_idx = time.time()
         index = BlockingIndex(max_block_size=max_block_size)
@@ -153,6 +219,22 @@ def run_full_test_inference(
         index.add_candidates(s3_c, source_name="source3")
         pruned = index.prune_large_blocks()
         print(f"  Inverted index built ({len(index.index):,} keys, {pruned:,} pruned) in {time.time()-t_idx:.2f}s", flush=True)
+
+        # Build fast candidate record store
+        t_store = time.time()
+        print("  Building candidate record lookup store...", flush=True)
+        cand_store = {}
+        for eid, bn, ba, ctry, nn, cn, na, nc in zip(
+            s2_c["entity_id"], s2_c["business_name"], s2_c["business_address"], s2_c["country"],
+            s2_c["norm_name"], s2_c["core_name"], s2_c["norm_addr"], s2_c["norm_country"]
+        ):
+            cand_store[eid] = (bn, ba, ctry, nn, cn, na, nc)
+        for eid, bn, ba, ctry, nn, cn, na, nc in zip(
+            s3_c["entity_id"], s3_c["business_name"], s3_c["business_address"], s3_c["country"],
+            s3_c["norm_name"], s3_c["core_name"], s3_c["norm_addr"], s3_c["norm_country"]
+        ):
+            cand_store[eid] = (bn, ba, ctry, nn, cn, na, nc)
+        print(f"  Candidate store built ({len(cand_store):,} records) in {time.time()-t_store:.2f}s", flush=True)
 
         # Query index and predict for S1 in batches
         n_s1_country = len(s1_c)
@@ -175,7 +257,7 @@ def run_full_test_inference(
             s1_batch["norm_addr"] = s1_batch["business_address"].apply(normalize_address)
             s1_batch["norm_country"] = s1_batch["country"].apply(normalize_country)
 
-            # Generate candidate keys and retrieve candidates
+            # Generate candidate keys and retrieve candidates with key weighting
             s1_keys_list = generate_blocking_keys(s1_batch)
             s1_ids = s1_batch["entity_id"].tolist()
 
@@ -185,15 +267,18 @@ def run_full_test_inference(
             s1_candidates_dict = {}
 
             for s1_id, keys in zip(s1_ids, s1_keys_list):
-                cand_scores = defaultdict(int)
+                cand_scores = defaultdict(float)
                 cand_source_map = {}
 
                 for k in keys:
                     if k in index.index:
                         cand_list = index.index[k]
                         if len(cand_list) <= index.max_block_size:
+                            parts = k.split("|", 2)
+                            k_type = parts[1] if len(parts) > 1 else ""
+                            w = DEFAULT_KEY_WEIGHTS.get(k_type, 1.0)
                             for cand_id, cand_src in cand_list:
-                                cand_scores[cand_id] += 1
+                                cand_scores[cand_id] += w
                                 cand_source_map[cand_id] = cand_src
 
                 sorted_cands = sorted(cand_scores.items(), key=lambda x: (-x[1], x[0]))
@@ -222,38 +307,76 @@ def run_full_test_inference(
                 unique_batch_s1 = set(batch_pairs_s1)
                 unique_batch_cands = set(batch_pairs_cand)
 
-                # Load lookups ONLY for records present in this batch
-                lookups = load_entity_lookups(
-                    s1_df=s1_batch,
-                    s2_df=s2_c,
-                    s3_df=s3_c,
-                    needed_s1_ids=unique_batch_s1,
-                    needed_cand_ids=unique_batch_cands,
-                )
+                # Fast preprocessed lookups using pre-normalized strings
+                lookups = {}
+                for eid, bn, ba, ctry, nn, cn, na, nc in zip(
+                    s1_batch["entity_id"], s1_batch["business_name"], s1_batch["business_address"], s1_batch["country"],
+                    s1_batch["norm_name"], s1_batch["core_name"], s1_batch["norm_addr"], s1_batch["norm_country"]
+                ):
+                    lookups[eid] = fast_preprocess_record(bn, ba, ctry, nn, cn, na, nc)
+
+                for cid in unique_batch_cands:
+                    cand_rec = cand_store.get(cid)
+                    if cand_rec is not None:
+                        lookups[cid] = fast_preprocess_record(*cand_rec)
 
                 # Compute features
                 feat_df = generate_feature_matrix(cand_df, lookups)
-                del lookups, cand_df
-                gc.collect()
 
                 # Inference
                 X_batch = feat_df[feature_names].values
                 probs = model.predict_proba(X_batch)[:, 1]
 
-                # Aggregate passing matches per S1
+                # Determine country-calibrated base threshold
+                if country == "US":
+                    base_t = max(threshold, 0.78)
+                elif country == "India":
+                    base_t = max(threshold, 0.76)
+                else:
+                    base_t = max(threshold, 0.75)
+
+                # Precompute candidate rank map for this batch
+                cand_rank_map = {}
+                for s1_id in s1_ids:
+                    c_list = s1_candidates_dict.get(s1_id, [])
+                    for rk, cid in enumerate(c_list, start=1):
+                        cand_rank_map[(s1_id, cid)] = rk
+
+                # Aggregate passing matches per S1 with precision guards
                 s1_matches_dict = defaultdict(list)
                 for s1_id, c_id, prob in zip(batch_pairs_s1, batch_pairs_cand, probs):
-                    if prob >= threshold:
-                        if c_id.startswith(("S2-", "S3-")):
-                            s1_matches_dict[s1_id].append((c_id, float(prob)))
+                    if not c_id.startswith(("S2-", "S3-")):
+                        continue
 
-                del feat_df, X_batch
-                gc.collect()
+                    # Dynamic Rank-Calibrated Threshold
+                    rk = cand_rank_map.get((s1_id, c_id), 1)
+                    if rk <= 3:
+                        req_t = base_t
+                    elif rk <= 6:
+                        req_t = base_t + 0.03
+                    elif rk <= 10:
+                        req_t = base_t + 0.06
+                    else:
+                        req_t = base_t + 0.09
+
+                    if prob < req_t:
+                        continue
+
+                    # Precision Incompatibility Guards
+                    s1_rec = lookups.get(s1_id)
+                    c_rec = lookups.get(c_id)
+                    if s1_rec and c_rec:
+                        # 1. Branch Conflict Veto (e.g. North vs South)
+                        if has_branch_conflict(s1_rec["norm_name"], c_rec["norm_name"]):
+                            continue
+                        # 2. Building Clash Veto (e.g. 2798 vs 809 on different core names)
+                        if has_building_clash(s1_rec["bldg_no"], c_rec["bldg_no"], s1_rec["core_name"], c_rec["core_name"]):
+                            continue
+
+                    s1_matches_dict[s1_id].append((c_id, float(prob)))
 
                 for s1_id in s1_ids:
                     c_list = s1_candidates_dict.get(s1_id, [])
-                    candidates_map[s1_id] = c_list
-
                     m_tuples = s1_matches_dict.get(s1_id, [])
                     if m_tuples:
                         m_tuples.sort(key=lambda x: (-x[1], x[0]))
@@ -263,10 +386,43 @@ def run_full_test_inference(
                             if cid not in seen_m:
                                 seen_m.add(cid)
                                 m_list.append(cid)
+
+                        # 3. Cross-Source Triangular Consistency:
+                        if len(m_list) >= 2:
+                            s2_m = [c for c in m_list if c.startswith("S2-")]
+                            s3_m = [c for c in m_list if c.startswith("S3-")]
+                            if s2_m and s3_m:
+                                top_s2 = s2_m[0]
+                                top_s3 = s3_m[0]
+                                rec2 = lookups.get(top_s2)
+                                rec3 = lookups.get(top_s3)
+                                if rec2 and rec3:
+                                    b2 = rec2.get("bldg_no", "")
+                                    b3 = rec3.get("bldg_no", "")
+                                    if b2 and b3 and b2 != b3:
+                                        p2 = next((p for c, p in m_tuples if c == top_s2), 0.0)
+                                        p3 = next((p for c, p in m_tuples if c == top_s3), 0.0)
+                                        if p2 >= p3:
+                                            m_list = [c for c in m_list if c != top_s3]
+                                        else:
+                                            m_list = [c for c in m_list if c != top_s2]
+
+                        # Enforce strict subset guarantee: all matches MUST be in candidates
+                        c_set = set(c_list)
+                        for cid in m_list:
+                            if cid not in c_set:
+                                c_list.append(cid)
+                                c_set.add(cid)
+
                         matching_map[s1_id] = m_list
+                        candidates_map[s1_id] = c_list
                         country_matches += len(m_list)
                     else:
                         matching_map[s1_id] = []
+                        candidates_map[s1_id] = c_list
+
+                del lookups, cand_df, feat_df, X_batch, cand_rank_map, s1_matches_dict
+                gc.collect()
             else:
                 for s1_id in s1_ids:
                     candidates_map[s1_id] = []
@@ -280,9 +436,10 @@ def run_full_test_inference(
 
         total_candidates_evaluated += country_candidates
         total_matches_found += country_matches
-        print(f"  Finished {country} in {time.time()-c_start:.2f}s | Candidates: {country_candidates:,} | Matches: {country_matches:,}", flush=True)
+        avg_cands_country = country_candidates / max(1, n_s1_country)
+        print(f"  Finished {country} in {time.time()-c_start:.2f}s | Candidates: {country_candidates:,} (avg {avg_cands_country:.1f}/S1) | Matches: {country_matches:,}", flush=True)
 
-        del index, s2_c, s3_c, s1_c
+        del index, s2_c, s3_c, s1_c, cand_store
         gc.collect()
 
     del s1_full_df
@@ -312,6 +469,7 @@ def run_full_test_inference(
     print(f"  Non-empty Predictions: {non_empty_count:,} ({non_empty_count/len(all_required_s1_ids)*100:.2f}%)", flush=True)
     print(f"  Empty Predictions:     {empty_count:,} ({empty_count/len(all_required_s1_ids)*100:.2f}%)", flush=True)
     print(f"  Total Match Links:     {n_links:,}", flush=True)
+    print(f"  Average Match Links/S1:{n_links/len(all_required_s1_ids):.2f}", flush=True)
     print(f"  Threshold Used:        {threshold:.2f}", flush=True)
 
     # 6. Run official validation check
@@ -347,5 +505,29 @@ def run_full_test_inference(
     }
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Official Test Set Inference Pipeline")
+    parser.add_argument("--test-dir", default="dataset/test", help="Path to test directory")
+    parser.add_argument("--model-path", default="dataset/person2/models/best_model.pkl", help="Path to trained LightGBM model")
+    parser.add_argument("--matching-out", default="output/matching_results.tsv", help="Matching results TSV path")
+    parser.add_argument("--candidate-out", default="output/candidate_pairs.tsv", help="Candidate pairs TSV path")
+    parser.add_argument("--threshold", type=float, default=0.75, help="Decision probability threshold (default: 0.75)")
+    parser.add_argument("--max-cands", type=int, default=20, help="Max candidates per query (default: 20)")
+    parser.add_argument("--batch-size", type=int, default=25000, help="S1 batch size (default: 25,000)")
+    parser.add_argument("--country", type=str, default=None, help="Filter for specific country (e.g. France, US, India)")
+    args = parser.parse_args()
+
+    run_full_test_inference(
+        test_dir=args.test_dir,
+        model_path=args.model_path,
+        output_matching_path=args.matching_out,
+        output_candidate_path=args.candidate_out,
+        threshold=args.threshold,
+        max_candidates_per_query=args.max_cands,
+        s1_batch_size=args.batch_size,
+        country_filter=args.country,
+    )
+
+
 if __name__ == "__main__":
-    run_full_test_inference()
+    main()

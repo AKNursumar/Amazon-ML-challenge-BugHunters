@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
 # OS / System files
 .DS_Store
 Thumbs.db
@@ -18,6 +24,13 @@ desktop.ini
 dataset/train/
 dataset/test/
 dataset/benchmark/
+*candidate_pairs*.tsv
+*candidate_pairs*.csv
+
+# Output Directory: Keep ONLY matching_results.tsv and .gitkeep
+output/*
+!output/matching_results.tsv
+!output/.gitkeep
 
 # Large Archives & Models
 *.zip
@@ -27,5 +40,6 @@ dataset/benchmark/
 *.bin
 *.onnx
 
-# Scratch logs & outputs
+# Scratch logs & temporary files
 *.log
+*.tmp
