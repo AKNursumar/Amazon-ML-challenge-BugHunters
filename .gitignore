@@ -18,7 +18,6 @@ desktop.ini
 dataset/train/
 dataset/test/
 dataset/benchmark/
-output/
 
 # Large Archives & Models
 *.zip
