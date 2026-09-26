@@ -96,6 +96,13 @@ def run_pipeline(
     print("=" * 85)
     t_start = time.time()
 
+    candidate_pairs_path = resolve_path(candidate_pairs_path)
+    ground_truth_path = resolve_path(ground_truth_path)
+    source1_path = resolve_path(source1_path)
+    source2_path = resolve_path(source2_path)
+    source3_path = resolve_path(source3_path)
+    output_dir = resolve_path(output_dir)
+
     models_dir = os.path.join(output_dir, "models")
     results_dir = os.path.join(output_dir, "results")
     predictions_dir = os.path.join(output_dir, "predictions")
