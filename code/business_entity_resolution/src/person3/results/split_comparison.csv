@@ -1,3 +1,0 @@
-Split,Holdout S1 Count,Optimal Threshold,Macro F0.5,Macro Precision,Macro Recall,Singleton Accuracy,Non-Singleton F0.5
-90% Train / 10% Val,499,0.75,0.9491,0.9763,0.9026,0.9444,0.9494
-80% Train / 20% Val,999,0.75,0.9481,0.9754,0.8999,0.9344,0.949
