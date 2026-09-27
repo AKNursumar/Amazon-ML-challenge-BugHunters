@@ -367,6 +367,24 @@ def normalize_address(address: Optional[str]) -> str:
     return text
 
 
+RE_INDIAN_LANDMARKS = re.compile(
+    r"\b(?:opp(?:osite)?(?:\s+to)?|near|nr\.?|behind|beside|in\s+front\s+of|adjacent\s+to|next\s+to)\b|"
+    r"\b(?:railway\s+station|bus\s+stand|bus\s+stop|metro\s+station|post\s+office|police\s+station|petrol\s+pump)\b|"
+    r"\b(?:gidc(?:\s+phase\s+\d+)?|midc|industrial\s+area|industrial\s+estate|phase\s+\d+|sector\s+\d+)\b|"
+    r"\b(?:main\s+market|subji\s+mandi|anaj\s+mandi|bazaar|chowk|chauraha|circle|cross\s+road)\b|"
+    r"\b(?:commercial\s+complex|shopping\s+complex|plaza|tower|towers|arcade|chambers|enclave)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_landmarks(address: Optional[str]) -> str:
+    """Strip common Indian and generic transit/commercial landmark phrases."""
+    if not address or str(address).lower() in ("nan", "none", "null", ""):
+        return ""
+    text = RE_INDIAN_LANDMARKS.sub(" ", str(address))
+    return RE_SPACE.sub(" ", text).strip()
+
+
 def extract_address_key(normalized_addr: str) -> str:
     """
     Extract a discriminative address blocking key:
@@ -385,6 +403,10 @@ def extract_address_key(normalized_addr: str) -> str:
         "near", "opp", "opposite", "behind", "road", "rd", "street", "st", "lane", "ln",
         "avenue", "ave", "drive", "dr", "highway", "hwy", "court", "ct", "circle", "cir",
         "terrace", "ter", "expressway", "expy", "parkway", "pkwy", "trail", "trl", "pl", "sq",
+        # Indian landmark & commercial stop words
+        "railway", "station", "stand", "stop", "metro", "chowk", "circle", "bazaar", "market",
+        "complex", "plaza", "tower", "towers", "arcade", "chamber", "chambers", "enclave",
+        "gidc", "midc", "industrial", "estate", "phase", "sector", "colony", "nagar",
         # French street and address stop words
         "rue", "ch", "chemin", "impasse", "imp", "all", "allee", "route", "rte", "quai",
         "cours", "crs", "pass", "passage", "fbg", "faubourg", "cedex", "res", "bldg",
@@ -416,3 +438,4 @@ def extract_address_key(normalized_addr: str) -> str:
         return num_token
 
     return ""
+

@@ -62,6 +62,177 @@ def has_building_clash(bldg1: str, bldg2: str, core1: str, core2: str) -> bool:
     return False
 
 
+def is_near_duplicate_record(rec1: dict, rec2: dict) -> bool:
+    """
+    Verify if two candidate records in the same source are internal duplicate filings:
+    - Same core business name, or
+    - High token overlap on normalized name (>= 0.88), and
+    - Compatible building numbers (not clashing).
+    """
+    if not rec1 or not rec2:
+        return False
+
+    core1 = rec1.get("core_name", "")
+    core2 = rec2.get("core_name", "")
+    if core1 and core2 and core1 == core2:
+        b1 = rec1.get("bldg_no", "")
+        b2 = rec2.get("bldg_no", "")
+        if b1 and b2 and b1 != b2:
+            return False
+        return True
+
+    name1 = rec1.get("norm_name", "")
+    name2 = rec2.get("norm_name", "")
+    toks1 = set(name1.split())
+    toks2 = set(name2.split())
+    if toks1 and toks2:
+        jaccard = len(toks1 & toks2) / len(toks1 | toks2)
+        if jaccard >= 0.88:
+            b1 = rec1.get("bldg_no", "")
+            b2 = rec2.get("bldg_no", "")
+            if b1 and b2 and b1 != b2:
+                return False
+            return True
+
+    return False
+
+
+class GlobalBipartiteMatcher:
+    """
+    Global Greedy Bipartite Matching Engine:
+    - Enforces strict mutual disjointness: no S2 or S3 entity is assigned to more than 1 S1 entity.
+    - Applies per-source cardinality cap: at most 1 primary match per source,
+      plus at most verified near-identical textual duplicates.
+    - Applies margin gap cutoff: if an S1 has competing ambiguous candidates, requires elite confidence.
+    - Applies hard incompatibility vetoes (branch directionals, building number clash).
+    """
+
+    def __init__(
+        self,
+        base_threshold: float = 0.88,
+        margin_cutoff: float = 0.15,
+        elite_threshold: float = 0.92,
+        max_matches_per_source: int = 2,
+    ):
+        self.base_threshold = base_threshold
+        self.margin_cutoff = margin_cutoff
+        self.elite_threshold = elite_threshold
+        self.max_matches_per_source = max_matches_per_source
+
+    def assign(
+        self,
+        candidate_edges: List[dict],
+        all_required_s1_ids: Iterable[str],
+        lookups: Dict[str, dict],
+    ) -> Dict[str, List[str]]:
+        """
+        candidate_edges: list of dicts with:
+            's1_id': str
+            'cand_id': str
+            'prob': float
+            'cand_src': str ('S2' or 'S3')
+            'rank': int
+        """
+        # Step 1: Precompute top 2 candidate probabilities per (s1_id, cand_src)
+        top_probs_by_src = defaultdict(list)
+        for e in candidate_edges:
+            s1_id = e["s1_id"]
+            c_src = e["cand_src"]
+            prob = e["prob"]
+            top_probs_by_src[(s1_id, c_src)].append(prob)
+
+        margin_abstain_set = set()
+        for key, p_list in top_probs_by_src.items():
+            if len(p_list) >= 2:
+                p_list.sort(reverse=True)
+                p1, p2 = p_list[0], p_list[1]
+                if (p1 - p2 < self.margin_cutoff) and p1 < self.elite_threshold:
+                    margin_abstain_set.add(key)
+
+        # Step 2: Sort all candidate edges across the entire catalog by prob descending
+        candidate_edges.sort(key=lambda x: (-x["prob"], x["cand_id"]))
+
+        assigned_cands: Dict[str, str] = {}  # cand_id -> s1_id (Strict 1-to-1 from candidate side)
+        s1_matches = defaultdict(list)        # s1_id -> list of cand_ids
+
+        for e in candidate_edges:
+            prob = e["prob"]
+            s1_id = e["s1_id"]
+            cand_id = e["cand_id"]
+            cand_src = e["cand_src"]
+
+            # Guard 1: Candidate already claimed by a higher-probability S1
+            if cand_id in assigned_cands:
+                continue
+
+            # Guard 2: Dynamic threshold by rank
+            rk = e.get("rank", 1)
+            req_t = self.base_threshold
+            if rk > 3:
+                req_t += 0.03
+            if rk > 6:
+                req_t += 0.03
+
+            if prob < req_t:
+                continue
+
+            # Guard 3: Margin Gap (if ambiguous between distractors, require elite confidence)
+            if (s1_id, cand_src) in margin_abstain_set and prob < self.elite_threshold:
+                continue
+
+            # Guard 4: Incompatibility Vetoes
+            s1_rec = lookups.get(s1_id)
+            c_rec = lookups.get(cand_id)
+            if s1_rec and c_rec:
+                if has_branch_conflict(s1_rec.get("norm_name", ""), c_rec.get("norm_name", "")):
+                    continue
+                if has_building_clash(
+                    s1_rec.get("bldg_no", ""),
+                    c_rec.get("bldg_no", ""),
+                    s1_rec.get("core_name", ""),
+                    c_rec.get("core_name", ""),
+                ):
+                    continue
+
+            # Guard 5: Per-Source Cardinality Cap & Duplicate Verification
+            existing_cands = s1_matches[s1_id]
+            same_source_existing = [c for c in existing_cands if c.startswith(cand_src)]
+
+            if not same_source_existing:
+                # First match from this source catalog
+                assigned_cands[cand_id] = s1_id
+                s1_matches[s1_id].append(cand_id)
+            else:
+                # Secondary match in the same source:
+                # MUST be a near-duplicate filing of the primary match!
+                if len(same_source_existing) < self.max_matches_per_source:
+                    primary_id = same_source_existing[0]
+                    rec_prim = lookups.get(primary_id)
+                    if rec_prim and c_rec and is_near_duplicate_record(rec_prim, c_rec):
+                        assigned_cands[cand_id] = s1_id
+                        s1_matches[s1_id].append(cand_id)
+
+        # Cross-Source Triangular Verification:
+        final_map: Dict[str, List[str]] = {}
+        for s1_id in all_required_s1_ids:
+            cands = s1_matches.get(s1_id, [])
+            if len(cands) >= 2:
+                s2_c = [c for c in cands if c.startswith("S2-")]
+                s3_c = [c for c in cands if c.startswith("S3-")]
+                if s2_c and s3_c:
+                    rec2 = lookups.get(s2_c[0])
+                    rec3 = lookups.get(s3_c[0])
+                    if rec2 and rec3:
+                        b2 = rec2.get("bldg_no", "")
+                        b3 = rec3.get("bldg_no", "")
+                        if b2 and b3 and b2 != b3:
+                            # Drop conflicting S3 candidate
+                            cands = [c for c in cands if not c.startswith("S3-")]
+            final_map[s1_id] = cands
+
+        return final_map
+
+
 class DecisionEngine:
     """
     Final decision engine applying threshold filtering, singleton guarding,

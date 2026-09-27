@@ -58,6 +58,7 @@ from dataset.person3.decision import (
     format_submission_files,
     has_branch_conflict,
     has_building_clash,
+    GlobalBipartiteMatcher,
 )
 from utils.validate_submission import validate
 
@@ -243,6 +244,9 @@ def run_full_test_inference(
 
         country_candidates = 0
         country_matches = 0
+        country_edges = []
+        country_lookups = {}
+        country_s1_ids = s1_c["entity_id"].tolist()
 
         for b_idx in range(num_batches):
             b_start_idx = b_idx * s1_batch_size
@@ -327,106 +331,56 @@ def run_full_test_inference(
                 X_batch = feat_df[feature_names].values
                 probs = model.predict_proba(X_batch)[:, 1]
 
-                # Determine country-calibrated base threshold
-                if country == "US":
-                    base_t = max(threshold, 0.78)
-                elif country == "India":
-                    base_t = max(threshold, 0.76)
-                else:
-                    base_t = max(threshold, 0.75)
-
                 # Precompute candidate rank map for this batch
                 cand_rank_map = {}
                 for s1_id in s1_ids:
                     c_list = s1_candidates_dict.get(s1_id, [])
+                    candidates_map[s1_id] = c_list
                     for rk, cid in enumerate(c_list, start=1):
                         cand_rank_map[(s1_id, cid)] = rk
 
-                # Aggregate passing matches per S1 with precision guards
-                s1_matches_dict = defaultdict(list)
+                # Collect candidate edges passing coarse threshold (>= 0.70)
                 for s1_id, c_id, prob in zip(batch_pairs_s1, batch_pairs_cand, probs):
                     if not c_id.startswith(("S2-", "S3-")):
                         continue
 
-                    # Dynamic Rank-Calibrated Threshold
-                    rk = cand_rank_map.get((s1_id, c_id), 1)
-                    if rk <= 3:
-                        req_t = base_t
-                    elif rk <= 6:
-                        req_t = base_t + 0.03
-                    elif rk <= 10:
-                        req_t = base_t + 0.06
-                    else:
-                        req_t = base_t + 0.09
-
-                    if prob < req_t:
+                    prob_f = float(prob)
+                    if prob_f < 0.70:
                         continue
 
-                    # Precision Incompatibility Guards
-                    s1_rec = lookups.get(s1_id)
-                    c_rec = lookups.get(c_id)
-                    if s1_rec and c_rec:
-                        # 1. Branch Conflict Veto (e.g. North vs South)
-                        if has_branch_conflict(s1_rec["norm_name"], c_rec["norm_name"]):
-                            continue
-                        # 2. Building Clash Veto (e.g. 2798 vs 809 on different core names)
-                        if has_building_clash(s1_rec["bldg_no"], c_rec["bldg_no"], s1_rec["core_name"], c_rec["core_name"]):
-                            continue
+                    rk = cand_rank_map.get((s1_id, c_id), 1)
+                    cand_src = "S2" if c_id.startswith("S2-") else "S3"
 
-                    s1_matches_dict[s1_id].append((c_id, float(prob)))
+                    country_edges.append({
+                        "s1_id": s1_id,
+                        "cand_id": c_id,
+                        "prob": prob_f,
+                        "cand_src": cand_src,
+                        "rank": rk,
+                    })
 
-                for s1_id in s1_ids:
-                    c_list = s1_candidates_dict.get(s1_id, [])
-                    m_tuples = s1_matches_dict.get(s1_id, [])
-                    if m_tuples:
-                        m_tuples.sort(key=lambda x: (-x[1], x[0]))
-                        seen_m = set()
-                        m_list = []
-                        for cid, _ in m_tuples:
-                            if cid not in seen_m:
-                                seen_m.add(cid)
-                                m_list.append(cid)
+                    if s1_id not in country_lookups:
+                        s1_rec = lookups.get(s1_id)
+                        if s1_rec:
+                            country_lookups[s1_id] = {
+                                "norm_name": s1_rec.get("norm_name", ""),
+                                "core_name": s1_rec.get("core_name", ""),
+                                "bldg_no": s1_rec.get("bldg_no", ""),
+                            }
+                    if c_id not in country_lookups:
+                        c_rec = lookups.get(c_id)
+                        if c_rec:
+                            country_lookups[c_id] = {
+                                "norm_name": c_rec.get("norm_name", ""),
+                                "core_name": c_rec.get("core_name", ""),
+                                "bldg_no": c_rec.get("bldg_no", ""),
+                            }
 
-                        # 3. Cross-Source Triangular Consistency:
-                        if len(m_list) >= 2:
-                            s2_m = [c for c in m_list if c.startswith("S2-")]
-                            s3_m = [c for c in m_list if c.startswith("S3-")]
-                            if s2_m and s3_m:
-                                top_s2 = s2_m[0]
-                                top_s3 = s3_m[0]
-                                rec2 = lookups.get(top_s2)
-                                rec3 = lookups.get(top_s3)
-                                if rec2 and rec3:
-                                    b2 = rec2.get("bldg_no", "")
-                                    b3 = rec3.get("bldg_no", "")
-                                    if b2 and b3 and b2 != b3:
-                                        p2 = next((p for c, p in m_tuples if c == top_s2), 0.0)
-                                        p3 = next((p for c, p in m_tuples if c == top_s3), 0.0)
-                                        if p2 >= p3:
-                                            m_list = [c for c in m_list if c != top_s3]
-                                        else:
-                                            m_list = [c for c in m_list if c != top_s2]
-
-                        # Enforce strict subset guarantee: all matches MUST be in candidates
-                        c_set = set(c_list)
-                        for cid in m_list:
-                            if cid not in c_set:
-                                c_list.append(cid)
-                                c_set.add(cid)
-
-                        matching_map[s1_id] = m_list
-                        candidates_map[s1_id] = c_list
-                        country_matches += len(m_list)
-                    else:
-                        matching_map[s1_id] = []
-                        candidates_map[s1_id] = c_list
-
-                del lookups, cand_df, feat_df, X_batch, cand_rank_map, s1_matches_dict
+                del lookups, cand_df, feat_df, X_batch, cand_rank_map
                 gc.collect()
             else:
                 for s1_id in s1_ids:
                     candidates_map[s1_id] = []
-                    matching_map[s1_id] = []
 
             b_time = time.time() - t_batch_start
             print(f"    Batch {b_idx+1}/{num_batches} ({len(s1_batch):,} S1s, {num_pairs:,} pairs) done in {b_time:.2f}s", flush=True)
@@ -434,10 +388,54 @@ def run_full_test_inference(
             del s1_batch, s1_keys_list, batch_pairs_s1, batch_pairs_cand, batch_pairs_src, s1_candidates_dict
             gc.collect()
 
+        # Determine country-calibrated base threshold and parameters
+        if country == "US":
+            base_t = max(threshold, 0.90)
+            margin_cut = 0.15
+            elite_t = 0.93
+        elif country == "India":
+            base_t = max(threshold, 0.88)
+            margin_cut = 0.15
+            elite_t = 0.92
+        else: # France
+            base_t = max(threshold, 0.86)
+            margin_cut = 0.12
+            elite_t = 0.90
+
+        print(f"\n  Executing Global Bipartite Matching for {country} (base_t={base_t:.2f}, margin={margin_cut:.2f}) across {len(country_edges):,} candidate edges...", flush=True)
+        matcher = GlobalBipartiteMatcher(
+            base_threshold=base_t,
+            margin_cutoff=margin_cut,
+            elite_threshold=elite_t,
+            max_matches_per_source=2,
+        )
+        country_matching_map = matcher.assign(
+            candidate_edges=country_edges,
+            all_required_s1_ids=country_s1_ids,
+            lookups=country_lookups,
+        )
+
+        for s1_id in country_s1_ids:
+            m_list = country_matching_map.get(s1_id, [])
+            # Enforce strict subset guarantee: all matches MUST be in candidates
+            c_list = candidates_map.get(s1_id, [])
+            c_set = set(c_list)
+            for mid in m_list:
+                if mid not in c_set:
+                    c_list.append(mid)
+                    c_set.add(mid)
+            candidates_map[s1_id] = c_list
+            matching_map[s1_id] = m_list
+            country_matches += len(m_list)
+
+        del country_edges, country_lookups, country_matching_map
+        gc.collect()
+
         total_candidates_evaluated += country_candidates
         total_matches_found += country_matches
         avg_cands_country = country_candidates / max(1, n_s1_country)
         print(f"  Finished {country} in {time.time()-c_start:.2f}s | Candidates: {country_candidates:,} (avg {avg_cands_country:.1f}/S1) | Matches: {country_matches:,}", flush=True)
+
 
         del index, s2_c, s3_c, s1_c, cand_store
         gc.collect()
@@ -511,7 +509,7 @@ def main():
     parser.add_argument("--model-path", default="dataset/person2/models/best_model.pkl", help="Path to trained LightGBM model")
     parser.add_argument("--matching-out", default="output/matching_results.tsv", help="Matching results TSV path")
     parser.add_argument("--candidate-out", default="output/candidate_pairs.tsv", help="Candidate pairs TSV path")
-    parser.add_argument("--threshold", type=float, default=0.75, help="Decision probability threshold (default: 0.75)")
+    parser.add_argument("--threshold", type=float, default=0.88, help="Decision probability threshold (default: 0.88)")
     parser.add_argument("--max-cands", type=int, default=20, help="Max candidates per query (default: 20)")
     parser.add_argument("--batch-size", type=int, default=25000, help="S1 batch size (default: 25,000)")
     parser.add_argument("--country", type=str, default=None, help="Filter for specific country (e.g. France, US, India)")
