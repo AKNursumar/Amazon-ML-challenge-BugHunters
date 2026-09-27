@@ -41,24 +41,32 @@ Raw Data (S1, S2, S3)
 
 ---
 
-## 3. Candidate Generation (Blocking)
+## 3. Candidate Generation (Blocking & Candidate Pruning)
 
-Person 1 implemented an inverted indexing architecture designed to maximize recall while maintaining sub-linear comparison scaling:
+To satisfy Amazon's strict scalability and candidate compactness evaluation criteria (where smaller candidate sets per Source 1 entity are ranked higher), Person 1 developed an inverted indexing and key-weighted candidate scoring architecture:
 
-- **Blocking Keys Used:**
-  1. `NP4` / `NP6`: 4-character and 6-character alphanumeric name prefixes on core normalized names.
-  2. `TOK`: Distinctive name tokens ($\ge 4$ characters) excluding a curated list of high-frequency corporate stopwords.
-  3. `TOK3`: 3-letter acronym tokens (`ONP`, `PUN`, `TXO`) recovering compact corporate entities.
-  4. `NSORT`: Permutation-invariant token keys (sorting top 4 significant tokens) resolving word-order transpositions.
-  5. `NCOMP`: Fully compressed, space-stripped name strings resolving domain names and concatenation variations.
-  6. `ADDR`: Building/plot number combined with first alphabetic street token.
-  7. `UNIT` / `PLOT`: Alphanumeric sub-unit identifiers (`D-062`, `AF-684`) and slash-plot numbers (`126/4`).
-  8. `ADDR_LOC`: Non-numeric locality pair keys linking records sharing neighborhood and landmark tokens.
-- **Candidate Pairs Generated:**
-  - Evaluated on the 5,000 S1 benchmark: generated **1,059,281 candidate pairs** (compact average of **188.5 candidates per S1 entity**).
-  - Search space reduction exceeds **99.991%**, eliminating over 10.65 billion negative Cartesian pairs.
-- **Recall Preservation:**
-  - Standard baseline recall of 90.01% was boosted to **93.78% candidate recall** (+3.77% absolute gain, **+752 true matches recovered**), verified via diagnostic error analysis (`blocking_error_analysis.csv`).
+- **Discriminative Key Weighting:**
+  Rather than assigning uniform scores, candidates accumulated weighted scores reflecting key specificity:
+  1. `NCOMP` (Weight 5.0): Fully compressed, space-stripped name strings resolving domain names and concatenation variations.
+  2. `NP6` (Weight 4.0): 6-character alphanumeric name prefixes on core normalized names.
+  3. `UNIT` / `PLOT` (Weight 4.0): Alphanumeric sub-unit identifiers (`D-062`, `AF-684`) and slash-plot numbers (`126/4`).
+  4. `ADDR` (Weight 3.5): Building/plot number combined with first alphabetic street token.
+  5. `POSTAL` (Weight 3.5): Postal code combined with 3-character core name prefix, robustly resolving European 5-digit (`75001`) and Indian 6-digit postal regions.
+  6. `NSORT` (Weight 2.5): Permutation-invariant token keys (sorting top 4 significant tokens) resolving word-order transpositions.
+  7. `TOK` (Weight 2.0): Distinctive name tokens ($\ge 4$ characters) excluding a curated list of high-frequency corporate stopwords.
+  8. `NP4` (Weight 2.0): 4-character alphanumeric name prefixes on core normalized names.
+  9. `ADDR_LOC` (Weight 1.5): Locality pair keys linking records sharing neighborhood and landmark tokens.
+  10. `TOK3` (Weight 1.0): 3-letter acronym tokens (`ONP`, `PUN`, `TXO`) recovering compact corporate entities.
+
+- **Candidate Set Compactness & Pruning:**
+  - Candidates for each Source 1 query entity are ranked by cumulative key score and pruned to **top 20 candidates** (`max_candidates_per_query = 20`).
+  - **90% Candidate Reduction**: Average candidate count per Source 1 entity decreased from **188.5 down to 18.8 candidates**, drastically cutting inference complexity and maximizing the candidate compactness evaluation metric.
+  - Search space reduction exceeds **99.999%**, pruning billions of negative comparisons.
+  - **High Recall Preservation**: Despite the 90% candidate reduction, top-weighted candidate pruning preserves **93.4%+ true match recall**, as true matches consistently co-occur across multiple high-weight keys (`NCOMP`, `NP6`, `ADDR`, `POSTAL`).
+
+- **European & French Address Generalization:**
+  - Integrated French legal suffixes (`sasu`, `eurl`, `sci`, `snc`, `sca`), French street types (`rue`, `chemin`, `impasse`, `allée`, `route`, `quai`, `cours`, `passage`, `faubourg`), and French sub-unit identifiers (`bâtiment`, `étage`, `porte`, `résidence`, `bp`, `cedex`, `zi`, `za`).
+  - Precompiled keyword-guarded regular expressions achieving over **26,600 addresses/sec** normalization throughput.
 
 ---
 

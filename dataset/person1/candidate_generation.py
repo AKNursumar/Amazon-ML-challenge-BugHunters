@@ -16,13 +16,29 @@ from .normalization import (
 )
 
 
+DEFAULT_KEY_WEIGHTS: dict[str, float] = {
+    "NCOMP": 5.0,
+    "NP6": 4.0,
+    "PLOT": 4.0,
+    "UNIT": 4.0,
+    "ADDR": 3.5,
+    "POSTAL": 3.5,
+    "NSORT": 2.5,
+    "TOK": 2.0,
+    "NP4": 2.0,
+    "ADDR_LOC": 1.5,
+    "TOK3": 1.0,
+}
+
+
 def generate_candidates(
     source1: pd.DataFrame,
     source2: pd.DataFrame,
     source3: pd.DataFrame,
     strategies: Optional[Set[str]] = None,
     max_block_size: int = 1000,
-    max_candidates_per_query: int = 300,
+    max_candidates_per_query: int = 20,
+    key_weights: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
     Generate candidate pairs between Source 1 and (Source 2 + Source 3).
@@ -31,7 +47,7 @@ def generate_candidates(
     1. Normalization of names, addresses, countries (preserving original columns).
     2. Inverted index construction for Source 2 and Source 3.
     3. Block pruning to prevent Cartesian product on generic terms.
-    4. Querying index for each Source 1 record.
+    4. Querying index for each Source 1 record using discriminative key weighting.
     5. Deduplication and deterministic formatting.
 
     Args:
@@ -40,11 +56,14 @@ def generate_candidates(
         source3: DataFrame containing Source 3 records.
         strategies: Set of blocking strategies to activate (None = all default strategies).
         max_block_size: Maximum records allowed in a single block before pruning.
-        max_candidates_per_query: Maximum candidates to retain per Source 1 entity.
+        max_candidates_per_query: Maximum candidates to retain per Source 1 entity (default 20 for compactness).
+        key_weights: Dict mapping key types ('NCOMP', 'NP6', 'ADDR', etc.) to scoring weights.
 
     Returns:
         pd.DataFrame with columns: ['source1_id', 'candidate_id', 'candidate_source']
     """
+    weights = key_weights or DEFAULT_KEY_WEIGHTS
+
     # Step 1: Normalize required fields if not already present
     for df in [source1, source2, source3]:
         if "norm_name" not in df.columns:
@@ -66,26 +85,29 @@ def generate_candidates(
     # Step 3: Prune oversized blocks
     index.prune_large_blocks()
 
-    # Step 4: Query index for Source 1 records
+    # Step 4: Query index for Source 1 records with key weighting
     s1_keys_list = generate_blocking_keys(source1, strategies=strategies)
     s1_ids = source1["entity_id"].tolist()
 
     records: List[Tuple[str, str, str]] = []
 
     for s1_id, keys in zip(s1_ids, s1_keys_list):
-        cand_scores = defaultdict(int)
+        cand_scores = defaultdict(float)
         cand_source_map = {}
 
         for k in keys:
             if k in index.index:
                 cand_list = index.index[k]
                 if len(cand_list) <= index.max_block_size:
+                    parts = k.split("|", 2)
+                    k_type = parts[1] if len(parts) > 1 else ""
+                    w = weights.get(k_type, 1.0)
                     for cand_id, cand_src in cand_list:
-                        cand_scores[cand_id] += 1
+                        cand_scores[cand_id] += w
                         cand_source_map[cand_id] = cand_src
 
         # Sort candidates by:
-        # 1. Negative score (highest overlap count first)
+        # 1. Negative weighted score (highest weighted overlap count first)
         # 2. Candidate ID (for deterministic tie-breaking)
         sorted_cands = sorted(cand_scores.items(), key=lambda x: (-x[1], x[0]))
 

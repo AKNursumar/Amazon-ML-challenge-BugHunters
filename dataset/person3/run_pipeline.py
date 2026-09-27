@@ -149,15 +149,18 @@ def main():
         )
 
     if args.mode in ["test", "both"]:
-        print("\n>>> GENERATING FINAL SUBMISSION FILES...")
-        generate_submission(
-            predictions_path=preds_path,
-            candidate_pairs_path=cands_path,
-            test_source1_path=test_s1_path,
+        print("\n>>> EXECUTING TEST SET INFERENCE & GENERATING SUBMISSION FILES...")
+        try:
+            from run_test_inference import run_full_test_inference
+        except ImportError:
+            from run_test_inference import run_full_test_inference
+
+        test_dir = os.path.dirname(test_s1_path)
+        run_full_test_inference(
+            test_dir=test_dir,
             output_matching_path=args.matching_out,
             output_candidate_path=args.candidate_out,
             threshold=args.threshold,
-            run_validation_check=True,
         )
 
 
